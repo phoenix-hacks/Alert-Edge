@@ -1,66 +1,81 @@
 import cv2
-import numpy as np
+import torch
+from ultralytics import YOLO
+from sort import Sort  # Import the SORT tracker
+import winsound  # To generate sound alerts (Windows only)
 
-# Load YOLO model for human detection
-net = cv2.dnn.readNet(r'D:\Human_line_detect\Resource\yolov3.weights', 
-                      r'D:\Human_line_detect\Resource\yolov3.cfg')
+# Load YOLOv8 lightweight model
+model = YOLO('yolov8n.pt')  # Use nano version for better speed
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# Use DroidCam IP as the video source
-droidcam_ip = 'http://192.168.1.92:4747/video'  # Replace with your actual DroidCam IP
-cap = cv2.VideoCapture(droidcam_ip)
+# Initialize SORT tracker
+tracker = Sort(max_age=30, min_hits=3, iou_threshold=0.3)
 
-# Define the x position for the vertical line crossing detection
-line_x_position = 200  # Adjust based on the video
+# Set up video source (DroidCam IP)
+video_source = 'http://192.168.25.217:4747/video'  # Replace with your DroidCam IP
+cap = cv2.VideoCapture(video_source)
 
-# Variable to count the number of line crossings
-crossing_count = 0
+# Parameters for line crossing
+line_x_position = 300  # X-coordinate of the blue line
+frame_skip = 2  # Skip frames for better performance
+frame_counter = 0
 
-# Define YOLO parameters
-conf_threshold = 0.5  # Confidence threshold
-nms_threshold = 0.4   # Non-maximum suppression threshold
-
-# Load the COCO class labels YOLO was trained on
-with open(r'D:\Human_line_detect\Resource\coco.names', 'r') as f:
-    classes = f.read().strip().split('\n')
-
-# Get the class ID for "person" in COCO dataset (usually ID 0 for YOLO models)
-person_class_id = classes.index('person')
+# Function to trigger a sound alert
+def play_alert_sound():
+    frequency = 1000  # Set frequency to 1000 Hz
+    duration = 1000  # Set duration to 1 second
+    winsound.Beep(frequency, duration)
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
+        print("Video stream disconnected or unable to fetch frames.")
         break
 
-    # Get frame dimensions
-    (frame_height, frame_width) = frame.shape[:2]
+    frame_counter += 1
+    if frame_counter % frame_skip != 0:
+        continue  # Skip frames for faster processing
 
-    # Create blob from the frame to pass into YOLO model
-    blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), swapRB=True, crop=False)
-    net.setInput(blob)
-    outputs = net.forward(net.getUnconnectedOutLayersNames())
+    # Perform YOLO inference
+    results = model.predict(frame, conf=0.5, device=device, stream=False)
 
-    # Initialize lists for bounding boxes and confidences
-    boxes = []
-    confidences = []
+    # Extract detections for 'person' class
+    detections = []
+    for detection in results[0].boxes.data.cpu().numpy():
+        x1, y1, x2, y2, confidence, class_id = detection[:6]
+        if int(class_id) == 0:  # Class 'person'
+            detections.append([x1, y1, x2, y2, confidence])
 
-    # Process each output
-    for output in outputs:
-        for detection in output:
-            scores = detection[5:]
-            class_id = np.argmax(scores)
-            confidence = scores[class_id]
+    # Convert detections to numpy array
+    detections = torch.tensor(detections) if detections else torch.empty((0, 5))
 
-            # Filter detections for humans only and above confidence threshold
-            if class_id == person_class_id and confidence > conf_threshold:
-                # Scale bounding box to frame size
-                box = detection[0:4] * np.array([frame_width, frame_height, frame_width, frame_height])
-                (centerX, centerY, width, height) = box.astype("int")
+    # Update tracker
+    tracks = tracker.update(detections)
 
-                # Calculate top-left corner coordinates
-                x = int(centerX - (width / 2))
-                y = int(centerY - (height / 2))
+    # Process tracks
+    for track in tracks:
+        x1, y1, x2, y2 = map(int, track[:4])
+        center_x = (x1 + x2) // 2
 
-                # Add bounding box and confidence to respective lists
-                boxes.append([x, y, int(width), int(height)])
-                confidences.append(float(confidence))
+        # Draw bounding box without ID
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
+        # Check if the person crosses the line from left to right
+        if center_x > line_x_position:
+            # Trigger an alert sound for the station controller
+            play_alert_sound()
+            # Display alert message on the screen
+            cv2.putText(frame, "ALERT: Person crossed the safety line", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+    # Draw crossing line (blue)
+    cv2.line(frame, (line_x_position, 0), (line_x_position, frame.shape[0]), (255, 0, 0), 2)
+
+    # Show the video feed
+    cv2.imshow('Vertical Line Crossing Detection', frame)
+
+    # Exit on 'q' key
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
